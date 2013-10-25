@@ -53,6 +53,31 @@ angular.module('ui.bootstrap.transition', [])
       deferred.reject('Transition cancelled');
     };
 
+    // Emulate transitionend event, useful when support is assumed to be
+    // available, but may not actually be used due to a transition property
+    // not being used in CSS (for example, in versions of firefox prior to 16,
+    // only -moz-transition is supported -- and is not used in Bootstrap3's CSS
+    // -- As such, no transitionend event would be fired due to no transition
+    // ever taking place. This method allows a fallback for such browsers.)
+    deferred.promise.emulateTransitionEnd = function(duration) {
+      var called = false;
+      deferred.promise.then(
+        function() { called = true; },
+        function() { called = true; }
+      );
+
+      var callback = function() {
+        if ( !called ) {
+          // If we got here, we probably aren't going to get a real 
+          // transitionend event. Emit a dummy to the handler.
+          element.triggerHandler(endEventName);
+        }        
+      };
+
+      $timeout(callback, duration);
+      return deferred.promise;
+    };
+
     return deferred.promise;
   };
 
@@ -93,12 +118,15 @@ angular.module('ui.bootstrap.collapse',['ui.bootstrap.transition'])
   // The fix is to remove the "collapse" CSS class while changing the height back to auto - phew!
   var fixUpHeight = function(scope, element, height) {
     // We remove the collapse CSS class to prevent a transition when we change to height: auto
+    var collapse = element.hasClass('collapse');
     element.removeClass('collapse');
     element.css({ height: height });
     // It appears that  reading offsetWidth makes the browser realise that we have changed the
     // height already :-/
     var x = element[0].offsetWidth;
-    element.addClass('collapse');
+    if(collapse) {
+      element.addClass('collapse');
+    }
   };
 
   return {
@@ -130,48 +158,206 @@ angular.module('ui.bootstrap.collapse',['ui.bootstrap.transition'])
           expand();
         }
       });
+
+      // Some jQuery-like functionality, based on implementation in Prototype.
+      //
+      // There is a problem with these: We're instantiating them for every
+      // instance of the directive, and that's not very good.
+      //
+      // But we do need a more robust way to calculate dimensions of an item,
+      // scrollWidth/scrollHeight is not super reliable, and we can't rely on
+      // jQuery or Prototype or any other framework being used.
+      var helpers = {
+        style: function(element, prop) {
+          var elem = element;
+          if(typeof elem.length === 'number') {
+            elem = elem[0];
+          }
+          function camelcase(name) {
+            return name.replace(/-+(.)?/g, function(match, chr) {
+              return chr ? chr.toUpperCase() : '';
+            });
+          }
+          prop = prop === 'float' ? 'cssFloat' : camelcase(prop);
+          var value = elem.style[prop];
+          if (!value || value === 'auto') {
+            var css = window.getComputedStyle(elem, null);
+            value = css ? css[prop] : null;
+          }
+          if (prop === 'opacity') {
+            return value ? parseFloat(value) : 1.0;
+          }
+          return value === 'auto' ? null : value;
+        },
+
+        size: function(element) {
+          var dom = element[0];
+          var display = helpers.style(element, 'display');
+
+          if (display && display !== 'none') {
+            // Fast case: rely on offset dimensions
+            return { width: dom.offsetWidth, height: dom.offsetHeight };
+          }
+  
+          // Slow case -- Save original CSS properties, update the CSS, and then
+          // use offset dimensions, and restore the original CSS
+          var currentStyle = dom.style;
+          var originalStyles = {
+            visibility: currentStyle.visibility,
+            position:   currentStyle.position,
+            display:    currentStyle.display
+          };
+
+          var newStyles = {
+            visibility: 'hidden',
+            display:    'block'
+          };
+
+          // Switching `fixed` to `absolute` causes issues in Safari.
+          if (originalStyles.position !== 'fixed') {
+            newStyles.position = 'absolute';
+          }
+
+          // Quickly swap-in styles which would allow us to utilize offset 
+          // dimensions
+          element.css(newStyles);
+
+          var dimensions = {
+            width:  dom.offsetWidth,
+            height: dom.offsetHeight
+          };
+
+          // And restore the original styles
+          element.css(originalStyles);
+
+          return dimensions;
+        },
+
+        width: function(element, value) {
+          if(typeof value === 'number' || typeof value === 'string') {
+            if(typeof value === 'number') {
+              value = value + 'px';
+            }
+            element.css({ 'width': value });
+            return;
+          }
+          return helpers.size(element).width;
+        },
       
+        height: function(element, value) {
+          if(typeof value === 'number' || typeof value === 'string') {
+            if(typeof value === 'number') {
+              value = value + 'px';
+            }
+            element.css({ 'height': value });
+            return;
+          }
+          return helpers.size(element).height;
+        },
+        
+        dimension: function() {
+          var hasWidth = element.hasClass('width');
+          return hasWidth ? 'width' : 'height';
+        }
+      };
+
+      var events = {
+        beforeShow: function(dimension, dimensions) {
+          element
+            .removeClass('collapse')
+            .removeClass('collapsed')
+            .addClass('collapsing');
+          helpers[dimension](element, 0);
+        },
+        
+        beforeHide: function(dimension, dimensions) {
+          // Read offsetHeight and reset height:
+          helpers[dimension](element, dimensions[dimension] + "px");
+          var unused = element[0].offsetWidth,
+              unused2 = element[0].offsetHeight;
+          element
+            .addClass('collapsing')
+            .removeClass('collapse')
+            .removeClass('in');
+        },
+        
+        afterShow: function(dimension) {
+          element
+            .removeClass('collapsing')
+            .addClass('in');
+          helpers[dimension](element, 'auto');
+          isCollapsed = false;
+        },
+        
+        afterHide: function(dimension) {
+          element
+            .removeClass('collapsing')
+            .addClass('collapsed')
+            .addClass('collapse');
+          isCollapsed = true;
+        }
+      };
 
       var currentTransition;
-      var doTransition = function(change) {
-        if ( currentTransition ) {
-          currentTransition.cancel();
+      var doTransition = function(showing, pixels) {
+        if (currentTransition || showing === element.hasClass('in')) {
+          return;
         }
-        currentTransition = $transition(element,change);
+
+        var dimension = helpers.dimension();
+        var dimensions = helpers.size(element);
+        var name = showing ? 'Show' : 'Hide';
+        
+        events['before' + name](dimension, dimensions);
+
+        var query = {};
+        var makeUpper = function(name) {
+          return name.charAt(0).toUpperCase() + name.slice(1);
+        };
+        if(pixels==='scroll') {
+          pixels = element[0][pixels + makeUpper(dimension)];
+        }
+        if(typeof pixels === 'number') {
+          pixels = pixels + "px";
+        }
+        query[dimension] = pixels;
+        currentTransition = $transition(element,query).emulateTransitionEnd(350);
         currentTransition.then(
-          function() { currentTransition = undefined; },
-          function() { currentTransition = undefined; }
+          function() {
+            events['after' + name](dimension);
+            currentTransition = undefined;
+          },
+          function(reason) {
+            var descr = showing ? 'expansion' : 'collapse';
+            currentTransition = undefined;
+          }
         );
         return currentTransition;
       };
 
       var expand = function() {
-        if (initialAnimSkip) {
+        if (initialAnimSkip || !$transition.transitionEndEventName) {
           initialAnimSkip = false;
-          if ( !isCollapsed ) {
-            fixUpHeight(scope, element, 'auto');
-          }
+          var dimension = helpers.dimension();
+          helpers[dimension](element, 'auto');
+          element
+            .removeClass('collapse')
+            .removeClass('collapsed');
+          events.afterShow(dimension);
         } else {
-          doTransition({ height : element[0].scrollHeight + 'px' })
-          .then(function() {
-            // This check ensures that we don't accidentally update the height if the user has closed
-            // the group while the animation was still running
-            if ( !isCollapsed ) {
-              fixUpHeight(scope, element, 'auto');
-            }
-          });
+          doTransition(true, 'scroll');
         }
-        isCollapsed = false;
       };
       
       var collapse = function() {
-        isCollapsed = true;
-        if (initialAnimSkip) {
+        if (initialAnimSkip || !$transition.transitionEndEventName) {
           initialAnimSkip = false;
-          fixUpHeight(scope, element, 0);
+          var dimension = helpers.dimension();
+          helpers[dimension](element, 0);
+          element.removeClass('in');
+          events.afterHide(dimension);
         } else {
-          fixUpHeight(scope, element, element[0].scrollHeight + 'px');
-          doTransition({'height':'0'});
+          doTransition(false, '0');
         }
       };
     }
@@ -1385,31 +1571,21 @@ angular.module('ui.bootstrap.modal', [])
 /**
  * A helper directive for the $modal service. It creates a backdrop element.
  */
-  .directive('modalBackdrop', ['$modalStack', '$timeout', function ($modalStack, $timeout) {
+  .directive('modalBackdrop', ['$timeout', function ($timeout) {
     return {
       restrict: 'EA',
       replace: true,
       templateUrl: 'template/modal/backdrop.html',
       link: function (scope, element, attrs) {
-
         //trigger CSS transitions
         $timeout(function () {
           scope.animate = true;
         });
-
-        scope.close = function (evt) {
-          var modal = $modalStack.getTop();
-          if (modal && modal.value.backdrop && modal.value.backdrop != 'static') {
-            evt.preventDefault();
-            evt.stopPropagation();
-            $modalStack.dismiss(modal.key, 'backdrop click');
-          }
-        };
       }
     };
   }])
 
-  .directive('modalWindow', ['$timeout', function ($timeout) {
+  .directive('modalWindow', ['$modalStack', '$timeout', function ($modalStack, $timeout) {
     return {
       restrict: 'EA',
       scope: {
@@ -1425,6 +1601,15 @@ angular.module('ui.bootstrap.modal', [])
         $timeout(function () {
           scope.animate = true;
         });
+
+        scope.close = function (evt) {
+          var modal = $modalStack.getTop();
+          if (modal && modal.value.backdrop && modal.value.backdrop != 'static' && (evt.target === evt.currentTarget)) {
+            evt.preventDefault();
+            evt.stopPropagation();
+            $modalStack.dismiss(modal.key, 'backdrop click');
+          }
+        };
       }
     };
   }])
@@ -1448,6 +1633,10 @@ angular.module('ui.bootstrap.modal', [])
         }
         return topBackdropIndex;
       }
+
+      $rootScope.$watch(openedWindows.length, function(noOfModals){
+        body.toggleClass('modal-open', openedWindows.length() > 0);
+      });
 
       $rootScope.$watch(backdropIndex, function(newBackdropIndex){
         backdropScope.index = newBackdropIndex;
@@ -1512,9 +1701,9 @@ angular.module('ui.bootstrap.modal', [])
       };
 
       $modalStack.close = function (modalInstance, result) {
-        var modal = openedWindows.get(modalInstance);
-        if (modal) {
-          modal.value.deferred.resolve(result);
+        var modalWindow = openedWindows.get(modalInstance).value;
+        if (modalWindow) {
+          modalWindow.deferred.resolve(result);
           removeModalWindow(modalInstance);
         }
       };
@@ -1536,11 +1725,13 @@ angular.module('ui.bootstrap.modal', [])
 
   .provider('$modal', function () {
 
-    var $modalProvider = {
-      options: {
-        backdrop: true, //can be also false or 'static'
-        keyboard: true
-      },
+    var defaultOptions = {
+      backdrop: true, //can be also false or 'static'
+      keyboard: true
+    };
+
+    return {
+      options: defaultOptions,
       $get: ['$injector', '$rootScope', '$q', '$http', '$templateCache', '$controller', '$modalStack',
         function ($injector, $rootScope, $q, $http, $templateCache, $controller, $modalStack) {
 
@@ -1573,15 +1764,15 @@ angular.module('ui.bootstrap.modal', [])
               result: modalResultDeferred.promise,
               opened: modalOpenedDeferred.promise,
               close: function (result) {
-                $modalStack.close(modalInstance, result);
+                $modalStack.close(this, result);
               },
               dismiss: function (reason) {
-                $modalStack.dismiss(modalInstance, reason);
+                $modalStack.dismiss(this, reason);
               }
             };
 
             //merge and clean up options
-            modalOptions = angular.extend({}, $modalProvider.options, modalOptions);
+            modalOptions = angular.extend({}, defaultOptions, modalOptions);
             modalOptions.resolve = modalOptions.resolve || {};
 
             //verify options
@@ -1596,8 +1787,6 @@ angular.module('ui.bootstrap.modal', [])
             templateAndResolvePromise.then(function resolveSuccess(tplAndVars) {
 
               var modalScope = (modalOptions.scope || $rootScope).$new();
-              modalScope.$close = modalInstance.close;
-              modalScope.$dismiss = modalInstance.dismiss;
 
               var ctrlInstance, ctrlLocals = {};
               var resolveIter = 1;
@@ -1638,8 +1827,6 @@ angular.module('ui.bootstrap.modal', [])
           return $modal;
         }]
     };
-
-    return $modalProvider;
   });
 angular.module('ui.bootstrap.pagination', [])
 
@@ -2487,6 +2674,7 @@ function TabsetCtrl($scope, $element) {
  * Tabset is the outer container for the tabs directive
  *
  * @param {boolean=} vertical Whether or not to use vertical styling for the tabs.
+ * @param {boolean=} justified Whether or not to use justified styling for the tabs.
  * @param {string=} direction  What direction the tabs should be rendered. Available:
  * 'right', 'left', 'below'.
  *
@@ -2494,13 +2682,17 @@ function TabsetCtrl($scope, $element) {
 <example module="ui.bootstrap">
   <file name="index.html">
     <tabset>
-      <tab heading="Vertical Tab 1"><b>First</b> Content!</tab>
-      <tab heading="Vertical Tab 2"><i>Second</i> Content!</tab>
+      <tab heading="Tab 1"><b>First</b> Content!</tab>
+      <tab heading="Tab 2"><i>Second</i> Content!</tab>
     </tabset>
     <hr />
     <tabset vertical="true">
       <tab heading="Vertical Tab 1"><b>First</b> Vertical Content!</tab>
       <tab heading="Vertical Tab 2"><i>Second</i> Vertical Content!</tab>
+    </tabset>
+    <tabset justified="true">
+      <tab heading="Justified Tab 1"><b>First</b> Justified Content!</tab>
+      <tab heading="Justified Tab 2"><i>Second</i> Justified Content!</tab>
     </tabset>
   </file>
 </example>
@@ -2517,6 +2709,7 @@ function TabsetCtrl($scope, $element) {
     compile: function(elm, attrs, transclude) {
       return function(scope, element, attrs, tabsetCtrl) {
         scope.vertical = angular.isDefined(attrs.vertical) ? scope.$parent.$eval(attrs.vertical) : false;
+        scope.justified = angular.isDefined(attrs.justified) ? scope.$parent.$eval(attrs.justified) : false;
         scope.type = angular.isDefined(attrs.type) ? scope.$parent.$eval(attrs.type) : 'tabs';
         scope.direction = angular.isDefined(attrs.direction) ? scope.$parent.$eval(attrs.direction) : 'top';
         scope.tabsAbove = (scope.direction != 'below');
